@@ -1,5 +1,5 @@
 -- =====================================================================
--- Tap Phaser   v1.0.1   2026-10-11
+-- Tap Phaser   v1.0.2   2026-10-11
 -- Created by Ian Peterson
 --
 -- Tap a rhythm on an executor key; get it back as a Shape (a phaser
@@ -23,10 +23,11 @@
 
 local pluginName, componentName, signalTable, myHandle = select(1, ...)
 
-local VERSION  = "1.0.1"
+local VERSION  = "1.0.2"
 local PREFIX   = "[TapPhaser] "
 local LOGNAME  = "TapPhaser_log.txt"
 local TEMPNAME = "TAP PHASER TEMP"
+local RECNAME  = "TAP - plugin again = END"   -- the temp sequence's label while recording
 local TIME_T   = 16777216      -- MA's internal 2^24 unit for times
 local SLOT_LO, SLOT_HI = 9901, 9990
 local MAX_REC  = 120           -- seconds; a take ends by itself after this
@@ -406,6 +407,62 @@ local function firstFree(pattern, lo, hi)
     return nil
 end
 
+local function disp(o, name)
+    local role = Enums and Enums.Roles and Enums.Roles.Display
+    local ok, v = pcall(function() return o:Get(name, role) end)
+    if ok and v ~= nil then return tostring(v) end
+    return tostring(prop(o, name))
+end
+
+-- A temp slot counts as free only if neither the command line nor the pool can see an object there.
+local function slotFree(kind, n)
+    if handleOf(kind .. " " .. n) ~= nil then return false end
+    local ok, o = pcall(function() return DataPool()[kind .. "s"][n] end)
+    if ok and o ~= nil then return false end
+    return true
+end
+
+local function freeTempSlot(kind)
+    for n = SLOT_LO, SLOT_HI do
+        if slotFree(kind, n) then return n end
+    end
+    return nil
+end
+
+-- Temp objects are recognised by their name, never by their number alone.
+local function isOurs(address)
+    local h = handleOf(address)
+    if h == nil then return false end
+    local n = tostring(prop(h, "Name"))
+    return n == TEMPNAME or n == RECNAME
+end
+
+local function deleteOurs(address)
+    if handleOf(address) == nil then return end
+    if isOurs(address) then
+        runq("Delete %s /NoConfirm", address)
+    else
+        log("left %s alone: it no longer carries the temp name, so it may not be ours", address)
+    end
+end
+
+-- Leftovers from a run that was killed mid-take. Asked about, never deleted silently.
+local function sweepLeftovers()
+    local found = {}
+    for n = SLOT_LO, SLOT_HI do
+        for _, kind in ipairs({ "Timecode", "Macro", "Sequence" }) do
+            if isOurs(kind .. " " .. n) then found[#found + 1] = kind .. " " .. n end
+        end
+    end
+    if #found == 0 then return end
+    log("leftover temp objects: %s", table.concat(found, ", "))
+    local ok, yes = pcall(Confirm, "Tap Phaser", "Found temp objects left by an earlier run:\n\n" ..
+        table.concat(found, ", ") .. "\n\nDelete them?\n(Say No if someone else is tapping a take right now.)", nil, false)
+    if ok and yes then
+        for _, a in ipairs(found) do deleteOurs(a) end
+    end
+end
+
 -- A take as text, so "Re-render last take" survives a plugin reload.
 local function encodeTake(take)
     local t0 = take.taps[1].on
@@ -660,6 +717,9 @@ end
 
 -- Returns: exists, verified, note
 local function render(shapeNo, name, plan, attrName)
+    if not slotFree("Shape", shapeNo) then          -- never write into, or delete, a shape that was already there
+        return false, false, fmt("Shape %d already exists", shapeNo)
+    end
     local ok, why = renderDirect(shapeNo, plan, attrName)
     local good, note = false, why
     if ok then good, note = verifyShape(shapeNo, plan, attrName) end
@@ -683,9 +743,9 @@ end
 -- The tap key: temp sequence on an executor, key = Flash
 -- ---------------------------------------------------------------------
 local function teardown(ctx)
-    if ctx.tcNo then runq("Delete Timecode %d /NoConfirm", ctx.tcNo) ctx.tcNo = nil end
-    if ctx.macNo then runq("Delete Macro %d /NoConfirm", ctx.macNo) ctx.macNo = nil end
-    if ctx.seqNo then runq("Delete Sequence %d /NoConfirm", ctx.seqNo) ctx.seqNo = nil end
+    if ctx.tcNo then deleteOurs("Timecode " .. ctx.tcNo) ctx.tcNo = nil end
+    if ctx.macNo then deleteOurs("Macro " .. ctx.macNo) ctx.macNo = nil end
+    if ctx.seqNo then deleteOurs("Sequence " .. ctx.seqNo) ctx.seqNo = nil end
     if ctx.prev then                                  -- the key held something before: put it back
         if run("Assign %s At Executor %d", ctx.prev.addr, ctx.prev.no) then
             coroutine.yield(0.2)
@@ -699,8 +759,9 @@ end
 local function setupKey(execNo)
     local ctx = {}
     S.ctx = ctx
-    ctx.seqNo = freeNumber("Sequence %d")
+    ctx.seqNo = freeTempSlot("Sequence")
     if not ctx.seqNo then stop("No free sequence slot in %d-%d.", SLOT_LO, SLOT_HI) return nil end
+    log("temp sequence slot: %d", ctx.seqNo)
     run("Store Sequence %d Cue 1 /NoConfirm", ctx.seqNo)
     ctx.seq = handleOf("Sequence " .. ctx.seqNo)
     if ctx.seq == nil then
@@ -736,7 +797,7 @@ local function setupKey(execNo)
         end
         -- leave "Assign Sequence N At" in the command line: macro line with Execute = No
         local want = "Assign Sequence " .. ctx.seqNo .. " At"
-        ctx.macNo = freeNumber("Macro %d")
+        ctx.macNo = freeTempSlot("Macro")
         if ctx.macNo then
             run("Store Macro %d", ctx.macNo)
             local mac = handleOf("Macro " .. ctx.macNo)
@@ -807,31 +868,82 @@ local function collectEvents(o, out, depth)
     end
 end
 
--- Only the track that recorded our own sequence; other executors touched during the take are ignored.
-local function ourEvents(tc, seq)
-    local own, all = {}, {}
+-- Is this timecode track the one that recorded OUR temp sequence?
+local function isOurTrack(track, seq, seqNo)
+    local target = prop(track, "Target")
+    if target ~= nil and same(target, seq) then return true, "target" end
+    local pat = "Sequence " .. seqNo .. "%f[%D]"
+    for _, name in ipairs({ "Target", "Object", "Name" }) do
+        local d = disp(track, name)
+        if d:find(pat) or d:find(TEMPNAME, 1, true) or d:find(RECNAME, 1, true) then return true, "label " .. name end
+    end
+    return false
+end
+
+-- Only the track that recorded our own sequence. Anything else that ran or was
+-- touched during the take sits in other tracks of the temp timecode and is ignored.
+-- Returns events (or nil when our track cannot be identified), and a note.
+local function ourEvents(tc, seq, seqNo)
+    local own, others, otherTracks, candidates = {}, 0, 0, {}
     for g = 1, count(tc) do
         local tg = child(tc, g)
         for t = 1, tg and count(tg) or 0 do
             local track = child(tg, t)
             if track ~= nil then
-                collectEvents(track, all, 0)
-                local target = prop(track, "Target")
-                if target ~= nil and same(target, seq) then collectEvents(track, own, 0) end
+                local evs = {}
+                collectEvents(track, evs, 0)
+                local mine, how = isOurTrack(track, seq, seqNo)
+                if mine then
+                    flog("  track %d.%d '%s': ours (%s), %d events", g, t, tostring(prop(track, "Name")), how, #evs)
+                    for _, e in ipairs(evs) do own[#own + 1] = e end
+                elseif #evs > 0 then
+                    flog("  track %d.%d '%s': not ours, %d events ignored", g, t, tostring(prop(track, "Name")), #evs)
+                    others, otherTracks = others + #evs, otherTracks + 1
+                    candidates[#candidates + 1] = evs
+                end
             end
         end
     end
-    if #own == 0 and #all > 0 then
-        log("no track is marked as our sequence - using all %d events", #all)
-        own = all
+    if #own == 0 and otherTracks == 1 then
+        -- exactly one track recorded anything, so it can only be the tap key
+        log("the tap track carried no recognisable label; it is the only track, so it is used")
+        own, others, otherTracks = candidates[1], 0, 0
+    elseif #own == 0 and otherTracks > 1 then
+        return nil, fmt("%d tracks were recorded and none could be identified as the tap key", otherTracks)
     end
-    table.sort(own, function(a, b) return a.t < b.t end)
-    return own
+    -- the tap key only ever sends Flash on and Flash off
+    local taps = {}
+    for _, e in ipairs(own) do
+        if e.name:find("Flash", 1, true) or e.status == "On" or e.status == "Off" then taps[#taps + 1] = e end
+    end
+    table.sort(taps, function(x, y) return x.t < y.t end)
+    local note = nil
+    if otherTracks > 0 then
+        note = fmt("%d events from %d other playbacks were recorded during the take and ignored", others, otherTracks)
+        log("%s", note)
+    end
+    return taps, note
+end
+
+-- Timecodes that are running right now (other than ours). If one of them is
+-- recording, the taps would land in it as well.
+local function otherRunningTimecodes(exceptNo)
+    local list = {}
+    local ok, kids = pcall(function() return DataPool().Timecodes:Children() end)
+    if not ok or type(kids) ~= "table" then return list end
+    for _, tc in ipairs(kids) do
+        local no = tonumber(prop(tc, "No"))
+        local okr, running = pcall(function() return tc:IsRunningPlayback() end)
+        if okr and running and no ~= exceptNo then
+            list[#list + 1] = fmt("Timecode %s '%s'", tostring(no), tostring(prop(tc, "Name")))
+        end
+    end
+    return list
 end
 
 -- Returns take { taps = { {on, off}, ... }, endT }  (seconds on the timecode clock), or nil.
 local function recordTake(ctx)
-    local tcNo = freeNumber("Timecode %d")
+    local tcNo = freeTempSlot("Timecode")
     if not tcNo then stop("No free timecode slot in %d-%d.", SLOT_LO, SLOT_HI) return nil end
     run("Store Timecode %d", tcNo)
     local tc = handleOf("Timecode " .. tcNo)
@@ -840,12 +952,32 @@ local function recordTake(ctx)
     run('Label Timecode %d "%s"', tcNo, TEMPNAME)
     run('Set Timecode %d Property "Duration" "%d"', tcNo, MAX_REC + 30)
 
+    -- Stopping this timecode must never switch off playbacks it happened to record.
+    pcall(function() tc.SwitchOff = false end)
+    if disp(tc, "SwitchOff") ~= "Keep Playbacks" then
+        runq('Set Timecode %d Property "SwitchOff" "Keep Playbacks"', tcNo)
+    end
+    local keeps = disp(tc, "SwitchOff")
+    log("temp timecode %d: SwitchOff = '%s'", tcNo, keeps)
+    local warn = ""
+    if keeps ~= "Keep Playbacks" then
+        warn = warn .. "\n\nWARNING: this timecode could not be set to keep playbacks. Anything else\n" ..
+               "you trigger during the take may be switched off when the take ends."
+    end
+    local running = otherRunningTimecodes(tcNo)
+    if #running > 0 then
+        log("other timecodes running: %s", table.concat(running, ", "))
+        warn = warn .. "\n\nNOTE: " .. table.concat(running, ", ") .. (#running == 1 and " is" or " are") ..
+               " running.\nIf it is recording, your taps will be recorded there too."
+    end
+
     local res = MessageBox({
         title = "Tap Phaser - ready",
         message = fmt("Tap key: executor %s (Flash).\n\nPress Record, then tap your rhythm. The loop starts on your first press.\n\n" ..
                       "To END: run this plugin again.\nThe pause between your last release and End is the tail;\n" ..
-                      "you choose afterwards whether to keep it.\n\nRecording stops by itself after %d seconds.",
-                      tostring(ctx.execNo or "?"), MAX_REC),
+                      "you choose afterwards whether to keep it.\n\nOther playbacks can keep running; only this key is read.\n" ..
+                      "Recording stops by itself after %d seconds.%s",
+                      tostring(ctx.execNo or "?"), MAX_REC, warn),
         commands = { { value = 1, name = "Record" }, { value = 0, name = "Cancel" } },
     })
     if type(res) ~= "table" or res.result ~= 1 then
@@ -857,7 +989,7 @@ local function recordTake(ctx)
     local tRec = now()
     S.endAt = nil
     S.phase = "recording"
-    pcall(function() ctx.seq.Name = "TAP - plugin again = END" end)
+    pcall(function() ctx.seq.Name = RECNAME end)
     log(">>> recording - run the plugin again to END <<<")
     while S.endAt == nil and now() - tRec < MAX_REC do coroutine.yield(0.03) end
     local endClock = S.endAt or now()
@@ -869,7 +1001,15 @@ local function recordTake(ctx)
 
     local endT = endClock - tRec
     log("END %.3f s after Record (timecode cursor read: %s)", endT, tostring(cursor))
-    local evs = ourEvents(tc, ctx.seq)
+    local evs, note = ourEvents(tc, ctx.seq, ctx.seqNo)
+    if evs == nil then
+        flog("timecode tree (track could not be identified):")
+        dumpTree(tc, "Timecode " .. tcNo, 4)
+        deleteOurs("Timecode " .. tcNo)
+        ctx.tcNo = nil
+        notice("Tap Phaser", "The take could not be read:\n%s.\n\nNothing was written. The details are in the log.", tostring(note))
+        return { taps = {}, endT = endT, unreadable = true }
+    end
     local taps, open, strays = {}, nil, 0
     for _, e in ipairs(evs) do
         flog("  event t=%8.3f  %s  (%s / %s)", e.t, e.on and "PRESS  " or "RELEASE", e.name, e.status)
@@ -890,9 +1030,9 @@ local function recordTake(ctx)
         log("  tap %2d  press=%7.3f  hold=%6.3f  then %6.3f s%s", i, tp.on - taps[1].on, tp.off - tp.on, gap,
             taps[i + 1] and "" or " (tail)")
     end
-    runq("Delete Timecode %d /NoConfirm", tcNo)
+    deleteOurs("Timecode " .. tcNo)
     ctx.tcNo = nil
-    return { taps = taps, endT = endT }
+    return { taps = taps, endT = endT, note = note }
 end
 
 -- ---------------------------------------------------------------------
@@ -973,9 +1113,9 @@ local function review(take, opt, allowRetake)
         if opt.mode == 2 then return fmt("%.2f beats at %g BPM (%.2f s)", p.beats, p.bpm, p.seconds) end
         return fmt("%.2f s", p.seconds)
     end
-    local msg = fmt("%d taps recorded%s.\n\nKEEP TAIL: loop is %s\nCHOP at the last release: loop is %s",
+    local msg = fmt("%d taps recorded%s.\n\nKEEP TAIL: loop is %s\nCHOP at the last release: loop is %s%s",
         #take.taps, keep.merged > 0 and fmt(" (%d landed on the same grid point and were merged)", keep.merged) or "",
-        len(keep), len(chop))
+        len(keep), len(chop), take.note and ("\n\n(" .. take.note .. ")") or "")
     local commands = { { value = 1, name = "Keep tail" }, { value = 2, name = "Chop" } }
     if allowRetake then commands[#commands + 1] = { value = 3, name = "Retake" } end
     commands[#commands + 1] = { value = 0, name = "Cancel" }
@@ -1001,14 +1141,16 @@ local function session()
         if c ~= 1 and c ~= 2 then log("cancelled") return end
         opt.tail = (c == 1)
     else
+        sweepLeftovers()
         local ctx = setupKey(opt.execNo)
         if not ctx then return end
         while true do
             take = recordTake(ctx)
             if not take then break end
             if #take.taps == 0 then
+                local what = take.unreadable and "That take could not be used." or "No taps were recorded."
                 take = nil
-                local okc, again = pcall(Confirm, "Tap Phaser", "No taps were recorded.\n\nTry again?", nil, false)
+                local okc, again = pcall(Confirm, "Tap Phaser", what .. "\n\nTry again?", nil, false)
                 if not (okc and again) then break end
             else
                 S.last = take
@@ -1042,9 +1184,12 @@ local function session()
             local okc, yes = pcall(Confirm, "Tap Phaser", fmt("Shape %d already exists.\n\nReplace it?", shapeNo), nil, false)
             if not (okc and yes) then log("kept the existing shape - nothing written") return end
             run("Delete Shape %d /NoConfirm", shapeNo)
+            coroutine.yield(0.1)
         end
     else
-        shapeNo = firstFree("Shape %d", 1, 9999)
+        for n = 1, 9999 do
+            if slotFree("Shape", n) then shapeNo = n break end
+        end
         if not shapeNo then stop("No free Shape slot.") return end
     end
     local name = (opt.name ~= "" and opt.name) or ("Tap " .. os.date("%H%M%S"))
