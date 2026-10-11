@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+TapPhaser_log.txt
+TapPhaserProbe_log.txt

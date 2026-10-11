@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<GMA3 DataVersion="2.0.2.0">
+  <UserPlugin Name="TapPhaser Probe" Author="Ian Peterson" Version="0.3.0.0">
+    <ComponentLua Name="TapPhaser Probe" FileName="TapPhaserProbe.lua"/>
+  </UserPlugin>
+</GMA3>
