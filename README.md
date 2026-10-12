@@ -140,20 +140,6 @@ a recipe step but does not stick. The plugin sets transitions through the
 - A single step can be at most 3200 % wide, so longer holds and gaps are split
   into several steps of the same value.
 
-## Tests
-
-`tests/fake_console.lua` is a stand-in console: fake clock, object tree,
-command line, dialogs and timecode. It lets the whole plugin run from Start to
-Shape without MA.
-
-```
-pip install lupa
-python3 tests/run_tests.py
-```
-
-Passing proves the plugin's logic. It does not prove a real console agrees;
-only the behaviours listed at the top of the fake are copied from one.
-
 ## Also in this repo
 
 `tools/TapPhaserProbe.lua` is the diagnostic plugin used to find the syntax
